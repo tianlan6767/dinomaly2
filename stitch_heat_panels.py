@@ -16,6 +16,7 @@ pred_mask 仍是整图门控后的二值结果。
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -39,13 +40,15 @@ def _jet(norm: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def _annotate_pred(pred: np.ndarray, score: float, thr: float, peak: float) -> np.ndarray:
+def _mask_floor(amap: np.ndarray, floor: float) -> np.ndarray:
+    """像素 >= ng_abs_floor 为白，不受整图门槛影响。"""
+    out = np.zeros(amap.shape, dtype=np.uint8)
+    out[amap.astype(np.float32) >= float(floor)] = 255
+    return out
+
+
+def _annotate_pred(pred: np.ndarray, lines: list[str]) -> np.ndarray:
     rgb = _gray_to_rgb(pred)
-    lines = [
-        f"score {score:.5f}",
-        f"thr   {thr:.5f}",
-        f"max   {peak:.5f}",
-    ]
     band = np.zeros((22 * len(lines) + 8, rgb.shape[1], 3), dtype=np.uint8)
     for i, line in enumerate(lines):
         cv2.putText(
@@ -61,7 +64,71 @@ def _annotate_pred(pred: np.ndarray, score: float, thr: float, peak: float) -> n
     return np.vstack([band, rgb])
 
 
-def _panel(rgb, gt, heat_max, heat_floor, pred_rgb, gap: int = 6) -> np.ndarray:
+def _components(amap: np.ndarray, seed_thr: float, score_thr: float) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """低门槛取出连通域，再用域内平均异常分数过滤。"""
+    seed = (amap.astype(np.float32) >= float(seed_thr)).astype(np.uint8)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(seed, connectivity=8)
+    kept = np.zeros(amap.shape, dtype=np.uint8)
+    rejected = np.zeros(amap.shape, dtype=np.uint8)
+    records: list[dict] = []
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        ys, xs = np.where(labels == i)
+        vals = amap[ys, xs]
+        mean = float(vals.mean())
+        peak = float(vals.max())
+        keep = mean >= float(score_thr)
+        if keep:
+            kept[labels == i] = 255
+        else:
+            rejected[labels == i] = 160
+        records.append({
+            "area": area,
+            "mean": mean,
+            "max": peak,
+            "keep": int(keep),
+            "cx": float(centroids[i, 0]),
+            "cy": float(centroids[i, 1]),
+        })
+    return kept, rejected, records
+
+
+def _draw_cc(kept: np.ndarray, rejected: np.ndarray, records: list[dict], score_thr: float) -> np.ndarray:
+    rgb = _gray_to_rgb(np.maximum(kept, rejected))
+    rgb[rejected > 0] = (70, 70, 70)
+    rgb[kept > 0] = (255, 255, 255)
+    for rec in records:
+        if rec["area"] < 40:
+            continue
+        color = (40, 220, 40) if rec["keep"] else (180, 80, 80)
+        cv2.putText(
+            rgb,
+            f"{rec['mean']:.4f}",
+            (int(rec["cx"]), int(rec["cy"])),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return _annotate_rgb(rgb, [
+        f"cc_thr {score_thr:.5f}",
+        f"keep {sum(r['keep'] for r in records)}/{len(records)}",
+        "white=keep gray=drop",
+    ])
+
+
+def _annotate_rgb(rgb: np.ndarray, lines: list[str]) -> np.ndarray:
+    band = np.zeros((22 * len(lines) + 8, rgb.shape[1], 3), dtype=np.uint8)
+    for i, line in enumerate(lines):
+        cv2.putText(
+            band, line, (8, 20 + i * 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA,
+        )
+    return np.vstack([band, rgb])
+
+
+def _panel(rgb, gt, heat_max, heat_floor, pred_rgb, pred_floor_rgb, cc_rgb, gap: int = 6) -> np.ndarray:
     extra = pred_rgb.shape[0] - rgb.shape[0]
 
     def _align(img: np.ndarray) -> np.ndarray:
@@ -75,7 +142,9 @@ def _panel(rgb, gt, heat_max, heat_floor, pred_rgb, gap: int = 6) -> np.ndarray:
         _add_label(_align(_gray_to_rgb(gt)), "gt"),
         _add_label(_align(heat_max), "heat/max"),
         _add_label(_align(heat_floor), "heat/floor"),
-        _add_label(pred_rgb, "pred"),
+        _add_label(pred_rgb, "pred/max"),
+        _add_label(pred_floor_rgb, "pred/floor"),
+        _add_label(cc_rgb, "pred/cc"),
     ]
     sep = np.full((parts[0].shape[0], gap, 3), 48, dtype=np.uint8)
     out = parts[0]
@@ -101,6 +170,8 @@ def main():
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--only-ng", action="store_true")
     p.add_argument("--img-thr", type=float, default=-1.0, help="override calib img_thr; pixel floor unchanged")
+    p.add_argument("--seed-thr", type=float, default=-1.0, help="loose mask threshold; default pix_thr")
+    p.add_argument("--cc-thr", type=float, default=-1.0, help="keep component if mean score >= this; default floor")
     args = p.parse_args()
 
     data_root = Path(args.data_root)
@@ -110,6 +181,8 @@ def main():
         calib["img_thr"] = float(args.img_thr)
     floor = float(calib["ng_abs_floor"])
     img_thr = float(calib["img_thr"])
+    seed_thr = float(args.seed_thr) if args.seed_thr >= 0 else float(calib["pix_thr"])
+    cc_thr = float(args.cc_thr) if args.cc_thr >= 0 else floor
     out_root = Path(args.out) if args.out else calib_path.parent / "panels_heat"
 
     meta = json.loads((data_root / "meta.json").read_text(encoding="utf-8"))
@@ -123,10 +196,11 @@ def main():
     args.upscale = True
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
     print(
-        f"device: {device}  images: {len(items)}  floor: {floor:.6f}  img_thr: {calib['img_thr']:.6f}",
+        f"device: {device}  images: {len(items)}  seed: {seed_thr:.6f}  cc_thr: {cc_thr:.6f}",
         flush=True,
     )
     model = build_model(args, device)
+    cc_rows: list[dict] = []
 
     for i, it in enumerate(items, 1):
         img_rel = it["img_path"].replace("\\", "/")
@@ -146,12 +220,36 @@ def main():
             amap = cv2.resize(amap, (w, h), interpolation=cv2.INTER_LINEAR)
         score = _image_score_from_amap(amap)
         pred = mask_gated(amap, score, calib)
+        pred_floor = _mask_floor(amap, floor)
         peak = float(amap.max())
         heat_max = _jet(amap / (peak + 1e-8))
         heat_floor = _jet(amap / floor)
-        pred_rgb = _annotate_pred(pred, score, img_thr, peak)
+        pred_rgb = _annotate_pred(pred, [
+            f"score {score:.5f}",
+            f"thr   {img_thr:.5f}",
+            f"max   {peak:.5f}",
+        ])
+        pred_floor_rgb = _annotate_pred(pred_floor, [
+            f"floor {floor:.5f}",
+            f"max   {peak:.5f}",
+            f"score {score:.5f}",
+        ])
+        kept, rejected, comps = _components(amap, seed_thr, cc_thr)
+        cc_rgb = _draw_cc(kept, rejected, comps, cc_thr)
+        for rec in comps:
+            cc_rows.append({
+                "img_path": img_rel,
+                "anomaly": int(it.get("anomaly", 0)),
+                "image_score": f"{score:.6f}",
+                "seed_thr": f"{seed_thr:.6f}",
+                "cc_thr": f"{cc_thr:.6f}",
+                "area": rec["area"],
+                "mean": f"{rec['mean']:.6f}",
+                "max": f"{rec['max']:.6f}",
+                "keep": rec["keep"],
+            })
 
-        panel = _panel(rgb, gt, heat_max, heat_floor, pred_rgb)
+        panel = _panel(rgb, gt, heat_max, heat_floor, pred_rgb, pred_floor_rgb, cc_rgb)
         dest = out_root / Path(img_rel).parent / f"{Path(img_rel).stem}_panel.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
         bgr = cv2.cvtColor(panel, cv2.COLOR_RGB2BGR)
@@ -159,7 +257,14 @@ def main():
         if i % 20 == 0 or i == len(items):
             print(f"  panels {i}/{len(items)}", flush=True)
 
+    cc_csv = out_root / "components.csv"
+    if cc_rows:
+        with cc_csv.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(cc_rows[0].keys()))
+            w.writeheader()
+            w.writerows(cc_rows)
     print(f"wrote panels under {out_root.resolve()}", flush=True)
+    print(f"components {len(cc_rows)} -> {cc_csv}", flush=True)
 
 
 if __name__ == "__main__":

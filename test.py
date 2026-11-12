@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 
 _DINO_ROOT = Path(__file__).resolve().parent
@@ -128,6 +129,13 @@ def _image_score_from_amap(amap: np.ndarray) -> float:
     return float(np.sort(flat)[-top_k:].mean())
 
 
+def _image_score_from_tensor(amap: torch.Tensor) -> torch.Tensor:
+    """最热 1% 的均值，留在 GPU 上。与 np.sort 取尾部再平均相同。"""
+    flat = amap.reshape(-1)
+    top_k = max(1, int(flat.numel() * 0.01))
+    return torch.topk(flat, top_k, sorted=False).values.mean()
+
+
 def _sample_pixels(amap: np.ndarray, max_n: int = 400_000) -> np.ndarray:
     flat = amap.astype(np.float64).ravel()
     if flat.size <= max_n:
@@ -209,7 +217,23 @@ def mask_gated(
 
 
 @torch.no_grad()
-def _forward_amap(model: Dinomaly, pil: Image.Image, args, device: torch.device) -> tuple[np.ndarray, tuple[int, int]]:
+def _score_and_mask_gpu(
+    amap: torch.Tensor,
+    calib: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """amap 为 GPU 上的 [H, W]。分数、峰值、mask 都在 GPU 上完成。"""
+    score = _image_score_from_tensor(amap)
+    peak = amap.max()
+    white = ((amap / (peak + 1e-8)) > 0.5).to(torch.uint8) * 255
+    keep = (score > float(calib["img_thr"])).to(torch.uint8)
+    return score, peak, white * keep
+
+
+@torch.no_grad()
+def _forward_amap_tensor(
+    model: Dinomaly, pil: Image.Image, args, device: torch.device
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """异常图留在 GPU。放大用双线性插值，不再把整张 float 图拷回 CPU。"""
     orig_w, orig_h = pil.size
     data_transform, _ = get_data_transforms(args.image_size, args.crop_size)
     tensor = data_transform(pil).unsqueeze(0).to(device)
@@ -218,13 +242,15 @@ def _forward_amap(model: Dinomaly, pil: Image.Image, args, device: torch.device)
     amap, _ = cal_anomaly_maps(en, de, tensor.shape[-1])
     gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
     amap = gaussian_kernel(amap)
-    amap_np = amap[0, 0].float().cpu().numpy()
+    if args.upscale and (amap.shape[-2] != orig_h or amap.shape[-1] != orig_w):
+        amap = F.interpolate(amap, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+    return amap[0, 0].contiguous(), (orig_w, orig_h)
 
-    if args.upscale:
-        amap_full = cv2.resize(amap_np, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-    else:
-        amap_full = amap_np
-    return amap_full, (orig_w, orig_h)
+
+@torch.no_grad()
+def _forward_amap(model: Dinomaly, pil: Image.Image, args, device: torch.device) -> tuple[np.ndarray, tuple[int, int]]:
+    amap, size = _forward_amap_tensor(model, pil, args, device)
+    return amap.float().cpu().numpy(), size
 
 
 def _mask_from_amap(amap: np.ndarray, args, thr: float | None = None) -> tuple[np.ndarray, float, float, float]:
@@ -347,25 +373,31 @@ def run_dataset(model: Dinomaly, args, device: torch.device) -> None:
         pil = Image.open(img_path).convert("RGB")
         _sync(device)
         t0 = time.perf_counter()
-        amap, _ = _forward_amap(model, pil, args, device)
         is_ng = anomaly == 1
-        image_score = _image_score_from_amap(amap)
         if calib is not None:
-            mask = mask_gated(amap, image_score, calib)
+            amap_t, _ = _forward_amap_tensor(model, pil, args, device)
+            score_t, peak_t, mask_t = _score_and_mask_gpu(amap_t, calib)
+            _sync(device)
+            infer_ms.append((time.perf_counter() - t0) * 1000.0)
+            image_score = float(score_t)
+            peak = float(peak_t)
+            mask = mask_t.cpu().numpy()
+            amap = amap_t.float().cpu().numpy() if args.save_heatmap else None
             mask_thr_note = f"calib img_thr={calib['img_thr']:.6g}"
             mask_thr_val = float(calib["img_thr"])
         else:
+            amap, _ = _forward_amap(model, pil, args, device)
+            image_score = _image_score_from_amap(amap)
             mask, _, _, thr_rel = _mask_from_amap(amap, args)
+            _sync(device)
+            infer_ms.append((time.perf_counter() - t0) * 1000.0)
+            peak = float(amap.max())
             mask_thr_note = args.thr_mode
             mask_thr_val = thr_rel
-        _sync(device)
-        infer_ms.append((time.perf_counter() - t0) * 1000.0)
         if is_ng:
             test_ng_scores.append(image_score)
         else:
             test_ok_scores.append(image_score)
-
-        peak = float(amap.max())
         mask_path = _save_mask_only(mask, img_path, data_root, out_dir)
         rows.append(
             {
@@ -561,16 +593,15 @@ def main():
         pil = Image.open(image_path).convert("RGB")
         _sync(device)
         t0 = time.perf_counter()
-        amap, (orig_w, orig_h) = _forward_amap(model, pil, args, device)
-        image_score = _image_score_from_amap(amap)
-        mask = mask_gated(amap, image_score, calib)
+        amap_t, (orig_w, orig_h) = _forward_amap_tensor(model, pil, args, device)
+        score_t, peak_t, mask_t = _score_and_mask_gpu(amap_t, calib)
         _sync(device)
         one_ms = (time.perf_counter() - t0) * 1000.0
         result = {
-            "amap": amap,
-            "mask": mask,
-            "image_score": image_score,
-            "peak": float(amap.max()),
+            "amap": amap_t.float().cpu().numpy(),
+            "mask": mask_t.cpu().numpy(),
+            "image_score": float(score_t),
+            "peak": float(peak_t),
             "thr": float(calib["img_thr"]),
             "orig_size": (orig_w, orig_h),
             "crop_size": args.crop_size,
